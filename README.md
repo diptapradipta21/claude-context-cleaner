@@ -30,7 +30,17 @@ A single untracked `package-lock.json` can quietly eat **50,000+ tokens** in a s
 python3 cleaner.py /path/to/your/project
 ```
 
-### 2. Generate Optimized `.claudeignore`
+### 2. View Top 5 Offenders Only
+```bash
+python3 cleaner.py /path/to/your/project --top 5
+```
+
+### 3. Machine-Readable JSON Output (for CI/CD or Agent Tool Calls)
+```bash
+python3 cleaner.py /path/to/your/project --json
+```
+
+### 4. Generate Optimized `.claudeignore`
 ```bash
 python3 cleaner.py /path/to/your/project --init-ignore
 ```

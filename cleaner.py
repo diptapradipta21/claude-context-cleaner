@@ -5,10 +5,14 @@ Scans workspace directories, identifies token-bloating artifacts (lockfiles, ove
 and generates clean .claudeignore / .ignore files or prunes bloat to conserve Claude's 200k/1M token window.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
 import os
 import sys
-import argparse
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 # Standard file extensions & directories that waste AI context tokens
 BLOAT_DIRECTORIES = {
@@ -49,96 +53,155 @@ Pipfile.lock
 
 # Binary, media & heavy databases
 *.sqlite
+*.sqlite3
 *.db
 *.parquet
 *.onnx
+*.pkl
 *.bin
-*.tar.gz
+*.tar
+*.gz
 *.zip
 *.mp4
 *.mp3
 *.wav
 
-# Caches & Logs
-.cache/
-*.log
+# Coverage & test output
 coverage/
-.git/
+*.lcov
 """
 
-def estimate_tokens(size_bytes):
-    # Rule of thumb for code/text: ~4 chars per token -> ~4 bytes per token
-    return size_bytes // 4
 
-def scan_directory(root_dir, size_threshold_kb=100):
+def estimate_tokens(file_size_bytes: int) -> int:
+    """Rough heuristic: ~1 token per 3.8-4 bytes of plain code/json text."""
+    return int(file_size_bytes / 3.9)
+
+
+def scan_directory(
+    root_dir: str,
+    size_threshold_kb: int = 100,
+    top_n: int = 15,
+    as_json: bool = False,
+    summary_only: bool = False
+) -> Tuple[List[Dict[str, Any]], int, int]:
     root = Path(root_dir).resolve()
-    print(f"[*] Scanning workspace for token bloat: {root}")
-    
+    if not root.exists():
+        if as_json:
+            print(json.dumps({"error": f"Path does not exist: {root}"}))
+        else:
+            print(f"[x] Error: Path does not exist: {root}", file=sys.stderr)
+        return [], 0, 0
+
+    if not as_json and not summary_only:
+        print(f"[*] Scanning workspace for token bloat: {root}")
+
+    bloat_files: List[Dict[str, Any]] = []
     total_wasted_bytes = 0
-    bloat_files = []
-    
+
     for dirpath, dirnames, filenames in os.walk(root):
         rel_dir = os.path.relpath(dirpath, root)
-        parts = rel_dir.split(os.sep)
-        
-        # Check if inside bloat directory
+        parts = rel_dir.split(os.sep) if rel_dir != "." else []
         is_bloat_dir = any(p in BLOAT_DIRECTORIES for p in parts)
-        
+
         for f in filenames:
             file_path = Path(dirpath) / f
             try:
                 stat = file_path.stat()
                 size = stat.st_size
                 ext = file_path.suffix.lower()
-                
+
                 is_large = size > (size_threshold_kb * 1024)
                 is_bloat_ext = ext in BLOAT_EXTENSIONS
-                
+
                 if is_bloat_dir or is_bloat_ext or is_large:
                     tokens = estimate_tokens(size)
                     total_wasted_bytes += size
-                    bloat_files.append((file_path.relative_to(root), size, tokens, is_bloat_dir, is_bloat_ext))
-            except Exception:
+                    bloat_files.append({
+                        "path": str(file_path.relative_to(root)),
+                        "size_bytes": size,
+                        "size_kb": round(size / 1024, 2),
+                        "estimated_tokens": tokens,
+                        "is_bloat_dir": is_bloat_dir,
+                        "is_bloat_ext": is_bloat_ext,
+                        "is_oversized": is_large
+                    })
+            except (OSError, PermissionError):
                 continue
 
-    # Sort by token size descending
-    bloat_files.sort(key=lambda x: x[1], reverse=True)
-    
+    bloat_files.sort(key=lambda x: x["size_bytes"], reverse=True)
     total_tokens = estimate_tokens(total_wasted_bytes)
-    print(f"[!] Found {len(bloat_files)} potential context-bloating files.")
-    print(f"[!] Total potential waste: {total_wasted_bytes / (1024*1024):.2f} MB (~{total_tokens:,} tokens)\n")
-    
-    print(f"{'Path':<65} | {'Size':<10} | {'Est. Tokens'}")
-    print("-" * 95)
-    for path, size, tokens, b_dir, b_ext in bloat_files[:15]:
-        size_str = f"{size / 1024:.1f} KB" if size < 1024*1024 else f"{size / (1024*1024):.2f} MB"
-        print(f"{str(path)[:63]:<65} | {size_str:<10} | ~{tokens:,}")
-        
-    return bloat_files, total_tokens
 
-def generate_claudeignore(root_dir, force=False):
+    if as_json:
+        payload = {
+            "root": str(root),
+            "file_count": len(bloat_files),
+            "total_wasted_bytes": total_wasted_bytes,
+            "total_wasted_mb": round(total_wasted_bytes / (1024 * 1024), 2),
+            "estimated_wasted_tokens": total_tokens,
+            "files": bloat_files[:top_n] if top_n > 0 else bloat_files
+        }
+        print(json.dumps(payload, indent=2))
+        return bloat_files, total_tokens, total_wasted_bytes
+
+    total_mb = total_wasted_bytes / (1024 * 1024)
+    print(f"[!] Found {len(bloat_files)} potential context-bloating files.")
+    print(f"[!] Total potential waste: {total_mb:.2f} MB (~{total_tokens:,} tokens)\n")
+
+    if not summary_only and bloat_files:
+        limit = top_n if top_n > 0 else len(bloat_files)
+        print(f"{'Path':<65} | {'Size':<10} | {'Est. Tokens'}")
+        print("-" * 95)
+        for item in bloat_files[:limit]:
+            size = item["size_bytes"]
+            size_str = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / (1024 * 1024):.2f} MB"
+            print(f"{item['path'][:63]:<65} | {size_str:<10} | ~{item['estimated_tokens']:,}")
+
+    return bloat_files, total_tokens, total_wasted_bytes
+
+
+def generate_claudeignore(root_dir: str, force: bool = False, as_json: bool = False) -> bool:
     target = Path(root_dir) / ".claudeignore"
     if target.exists() and not force:
-        print(f"\n[!] .claudeignore already exists at {target}. Use --force to overwrite.")
+        msg = f".claudeignore already exists at {target}. Use --force to overwrite."
+        if as_json:
+            print(json.dumps({"status": "skipped", "message": msg}))
+        else:
+            print(f"\n[!] {msg}")
         return False
-    with open(target, "w") as f:
+
+    with open(target, "w", encoding="utf-8") as f:
         f.write(DEFAULT_CLAUDEIGNORE)
-    print(f"\n[✓] Successfully generated optimized .claudeignore at: {target}")
+
+    if as_json:
+        print(json.dumps({"status": "created", "path": str(target)}))
+    else:
+        print(f"\n[✓] Successfully generated optimized .claudeignore at: {target}")
     return True
 
-def main():
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Audit and clean token waste for Claude Code and AI coding agents.")
     parser.add_argument("path", nargs="?", default=".", help="Workspace path to scan (default: current directory)")
     parser.add_argument("--init-ignore", action="store_true", help="Generate optimized .claudeignore in target path")
     parser.add_argument("--threshold", type=int, default=100, help="File size threshold in KB to flag (default: 100)")
+    parser.add_argument("--top", type=int, default=15, help="Number of largest bloat files to display (default: 15)")
+    parser.add_argument("--summary-only", action="store_true", help="Display aggregate waste metrics without itemized table")
+    parser.add_argument("--json", action="store_true", help="Output audit results as machine-readable JSON")
     parser.add_argument("--force", action="store_true", help="Overwrite existing .claudeignore")
-    
+
     args = parser.parse_args()
-    
-    scan_directory(args.path, args.threshold)
-    
+
+    scan_directory(
+        args.path,
+        size_threshold_kb=args.threshold,
+        top_n=args.top,
+        as_json=args.json,
+        summary_only=args.summary_only
+    )
+
     if args.init_ignore:
-        generate_claudeignore(args.path, args.force)
+        generate_claudeignore(args.path, force=args.force, as_json=args.json)
+
 
 if __name__ == "__main__":
     main()
